@@ -446,52 +446,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const interactive = details?.interactive !== false;
 
       if (isPartial) {
+        // renderCall is always shown above — don't repeat name/icon here.
+        // Just show progress details below the call line.
         const startTime: number | undefined = details?.startTime;
         const phase: string | undefined = details?.phase;
         const sessionEntries: number | undefined = details?.sessionEntries;
         const sessionBytes: number | undefined = details?.sessionBytes;
 
-        const icon = interactive ? "▸" : "▹";
-
-        // Setup phases (before polling starts)
+        // Setup phases (before polling starts) — show phase directly
         if (phase && phase !== "running" && phase !== "loading") {
-          let text =
-            `${icon} ` +
-            theme.fg("toolTitle", theme.bold(name)) +
-            theme.fg("dim", ` — ${phase}`);
-          return new Text(text, 0, 0);
+          return new Text(theme.fg("dim", phase), 0, 0);
         }
 
         const elapsedText = startTime
           ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
           : "running…";
 
-        // Build status line with session progress
-        let statusSuffix = "";
+        // Build progress line
+        let progressParts: string[] = [elapsedText];
         if (phase === "loading") {
-          statusSuffix = " · loading…";
+          progressParts.push("loading…");
         } else if (sessionEntries != null && sessionBytes != null) {
-          statusSuffix = ` · ${sessionEntries} messages (${formatBytes(sessionBytes)})`;
+          progressParts.push(`${sessionEntries} messages (${formatBytes(sessionBytes)})`);
         }
 
-        let text =
-          `${icon} ` +
-          theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — ${elapsedText}${statusSuffix}`);
+        let text = theme.fg("dim", progressParts.join(" · "));
 
         if (interactive) {
           text +=
             "\n" +
             theme.fg("accent", `Switch to the "${name}" terminal. `) +
             theme.fg("dim", "Exit (Ctrl+D) to return.");
-        } else {
-          const taskPreview: string = details?.task ?? "";
-          const preview = taskPreview.length > 80 ? taskPreview.slice(0, 80) + "…" : taskPreview;
-          if (preview) {
-            text += "\n" + theme.fg("dim", `Task: ${preview}`);
-          } else {
-            text += "\n" + theme.fg("dim", "Running...");
-          }
         }
 
         return new Text(text, 0, 0);
@@ -676,6 +661,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const name = details?.name ?? "Resume";
 
       if (isPartial) {
+        // renderCall is always shown above — just show progress here.
         const startTime: number | undefined = details?.startTime;
         const sessionEntries: number | undefined = details?.sessionEntries;
         const sessionBytes: number | undefined = details?.sessionBytes;
@@ -683,15 +669,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
           : "running…";
 
-        let statusSuffix = "";
+        let progressParts: string[] = [elapsedText];
         if (sessionEntries != null && sessionBytes != null) {
-          statusSuffix = ` · ${sessionEntries} messages (${formatBytes(sessionBytes)})`;
+          progressParts.push(`${sessionEntries} messages (${formatBytes(sessionBytes)})`);
         }
 
-        let text =
-          "▸ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — ${elapsedText}${statusSuffix}`);
+        let text = theme.fg("dim", progressParts.join(" · "));
         text +=
           "\n" +
           theme.fg("accent", `Switch to the "${name}" terminal. `) +
