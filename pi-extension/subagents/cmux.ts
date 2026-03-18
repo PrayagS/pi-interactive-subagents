@@ -34,7 +34,21 @@ export function shellEscape(s: string): string {
  * Returns the surface ref (e.g. "surface:42").
  */
 export function createSurface(name: string): string {
-  const out = execSync(`cmux new-split right`, {
+  return createSurfaceSplit(name, "right");
+}
+
+/**
+ * Create a new cmux terminal split in the given direction from an optional
+ * source surface. Sets the tab title and focuses the new panel.
+ * Returns the surface ref (e.g. "surface:42").
+ */
+export function createSurfaceSplit(
+  name: string,
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  const surfaceArg = fromSurface ? ` --surface ${shellEscape(fromSurface)}` : "";
+  const out = execSync(`cmux new-split ${direction}${surfaceArg}`, {
     encoding: "utf8",
   }).trim();
   // Output: "OK surface:42 workspace:3"

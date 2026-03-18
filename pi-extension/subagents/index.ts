@@ -8,6 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import {
   isCmuxAvailable,
   createSurface,
+  createSurfaceSplit,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -122,36 +123,267 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * Try to find and measure the sub-agent's session file.
- * Returns { entries, bytes } or null if not found yet.
+ * Try to find and measure a specific session file, or discover
+ * the right one from new files in the session directory.
+ *
+ * When `trackedFile` is provided, measures that file directly.
+ * Otherwise scans for new files not in `existingFiles` or `excludeFiles`.
+ *
+ * Returns { file, entries, bytes } — `file` is the path that was measured,
+ * so callers can lock onto it for subsequent calls.
  */
 function measureSessionProgress(
   sessionDir: string,
   existingFiles: Set<string>,
   forkedSessionFile: string | null,
-): { entries: number; bytes: number } | null {
+  trackedFile?: string | null,
+  excludeFiles?: Set<string>,
+): { file: string; entries: number; bytes: number } | null {
   try {
     if (forkedSessionFile) {
       const stat = statSync(forkedSessionFile);
       const raw = readFileSync(forkedSessionFile, "utf8");
       const entries = raw.split("\n").filter((l) => l.trim()).length;
-      return { entries, bytes: stat.size };
+      return { file: forkedSessionFile, entries, bytes: stat.size };
     }
+
+    // If we already know which file to track, use it directly
+    if (trackedFile) {
+      const stat = statSync(trackedFile);
+      const raw = readFileSync(trackedFile, "utf8");
+      const entries = raw.split("\n").filter((l) => l.trim()).length;
+      return { file: trackedFile, entries, bytes: stat.size };
+    }
+
     // Find the newest session file that wasn't there before
+    // and hasn't been claimed by another parallel agent
     const newFiles = readdirSync(sessionDir)
-      .filter((f) => f.endsWith(".jsonl") && !existingFiles.has(f))
+      .filter((f) => f.endsWith(".jsonl") && !existingFiles.has(f) && !(excludeFiles?.has(f)))
       .map((f) => {
         const p = join(sessionDir, f);
-        return { path: p, mtime: statSync(p).mtimeMs };
+        return { name: f, path: p, mtime: statSync(p).mtimeMs };
       })
       .sort((a, b) => b.mtime - a.mtime);
     if (newFiles.length === 0) return null;
     const stat = statSync(newFiles[0].path);
     const raw = readFileSync(newFiles[0].path, "utf8");
     const entries = raw.split("\n").filter((l) => l.trim()).length;
-    return { entries, bytes: stat.size };
+    return { file: newFiles[0].path, entries, bytes: stat.size };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Result from running a single subagent.
+ */
+interface SubagentResult {
+  name: string;
+  task: string;
+  summary: string;
+  sessionFile?: string;
+  interactive: boolean;
+  exitCode: number;
+  elapsed: number;
+  error?: string;
+}
+
+/**
+ * Core subagent execution logic. Spawns a sub-agent in a cmux terminal,
+ * polls for completion, extracts the summary, and returns a structured result.
+ *
+ * Used by both `subagent` (single) and `parallel_subagents` (concurrent) tools.
+ */
+async function runSubagent(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
+  signal: AbortSignal,
+  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
+  options?: { surface?: string; claimedFiles?: Set<string> },
+): Promise<SubagentResult> {
+  const interactive = params.interactive !== false;
+  const startTime = Date.now();
+
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveTools = params.tools ?? agentDefs?.tools;
+  const effectiveSkills = params.skills ?? agentDefs?.skills;
+  const effectiveThinking = agentDefs?.thinking;
+
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (!sessionFile) throw new Error("No session file");
+
+  let surface: string | null = null;
+  const surfacePreCreated = !!options?.surface;
+
+  try {
+    const sessionDir = dirname(sessionFile);
+    const existingSessionFiles = new Set(
+      readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
+    );
+
+    // Use pre-created surface (parallel mode) or create a new one
+    surface = options?.surface ?? createSurface(params.name);
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    }
+
+    // Build the task message
+    const modeHint = interactive
+      ? "The user will interact with you here. When done, they will exit with Ctrl+D."
+      : "Complete your task autonomously. When finished, call the subagent_done tool to close this session.";
+    const summaryInstruction =
+      "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+    const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+    const roleBlock = identity ? `\n\n${identity}` : "";
+    const fullTask = `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+
+    // Build pi command
+    const parts: string[] = ["pi"];
+
+    let forkedSessionFile: string | null = null;
+    if (params.fork) {
+      const { copySessionFile } = await import("./session.ts");
+      forkedSessionFile = copySessionFile(sessionFile, dirname(sessionFile));
+      parts.push("--session", shellEscape(forkedSessionFile));
+    } else {
+      parts.push("--session-dir", shellEscape(dirname(sessionFile)));
+    }
+
+    const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+    parts.push("-e", shellEscape(subagentDonePath));
+
+    if (effectiveModel) {
+      const model = effectiveThinking
+        ? `${effectiveModel}:${effectiveThinking}`
+        : effectiveModel;
+      parts.push("--model", shellEscape(model));
+    }
+
+    if (effectiveTools) {
+      const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+      const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
+      if (builtins.length > 0) {
+        parts.push("--tools", shellEscape(builtins.join(",")));
+      }
+    }
+
+    if (effectiveSkills) {
+      for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
+        parts.push(shellEscape(`/skill:${skill}`));
+      }
+    }
+
+    // Write context to artifact file
+    const sessionId = ctx.sessionManager.getSessionId();
+    const artifactDir = getArtifactDir(ctx.cwd, sessionId);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
+    const artifactPath = join(artifactDir, artifactName);
+    mkdirSync(dirname(artifactPath), { recursive: true });
+    writeFileSync(artifactPath, fullTask, "utf8");
+    parts.push(`@${artifactPath}`);
+
+    const piCommand = parts.join(" ");
+    const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+    sendCommand(surface, command);
+
+    // Track which session file belongs to THIS agent.
+    // In parallel mode, multiple agents share the same session directory.
+    // Without tracking, they'd all pick the "newest" file (same one).
+    let trackedFile: string | null = null;
+    const claimedFiles = options?.claimedFiles;
+
+    // Poll for exit
+    const interval = interactive ? 3000 : 1000;
+    const exitCode = await pollForExit(surface, signal, {
+      interval,
+      onTick() {
+        const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
+        const progress = measureSessionProgress(
+          sessionDir, existingSessionFiles, forkedSessionFile,
+          trackedFile, claimedFiles,
+        );
+        if (progress && !trackedFile) {
+          // Lock onto this file and claim it so other parallel agents skip it
+          trackedFile = progress.file;
+          if (claimedFiles) {
+            claimedFiles.add(basename(progress.file));
+          }
+        }
+        onProgress?.({ elapsed, entries: progress?.entries, bytes: progress?.bytes });
+      },
+    });
+
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
+    // Find session file — use tracked file if we already identified it
+    let subSessionFile: { path: string } | undefined;
+    if (forkedSessionFile) {
+      subSessionFile = { path: forkedSessionFile };
+    } else if (trackedFile) {
+      subSessionFile = { path: trackedFile };
+    } else {
+      // Fallback: scan for new files (single-agent mode or file appeared late)
+      const newFiles = readdirSync(sessionDir)
+        .filter((f) => f.endsWith(".jsonl") && !existingSessionFiles.has(f))
+        .map((f) => ({ name: f, path: join(sessionDir, f), mtime: statSync(join(sessionDir, f)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime);
+      subSessionFile = newFiles[0];
+    }
+
+    // Extract summary
+    let summary: string;
+    if (subSessionFile) {
+      const allEntries = getNewEntries(subSessionFile.path, 0);
+      summary =
+        findLastAssistantMessage(allEntries) ??
+        (exitCode !== 0
+          ? `Sub-agent exited with code ${exitCode}`
+          : "Sub-agent exited without output");
+    } else {
+      summary = exitCode !== 0
+        ? `Sub-agent exited with code ${exitCode}`
+        : "Sub-agent exited without output";
+    }
+
+    closeSurface(surface);
+    surface = null;
+
+    return {
+      name: params.name,
+      task: params.task,
+      summary,
+      sessionFile: subSessionFile?.path,
+      interactive,
+      exitCode,
+      elapsed,
+    };
+  } catch (err: any) {
+    if (surface) {
+      try { closeSurface(surface); } catch {}
+      surface = null;
+    }
+    if (signal.aborted) {
+      return {
+        name: params.name,
+        task: params.task,
+        summary: "Subagent cancelled.",
+        interactive,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: "cancelled",
+      };
+    }
+    return {
+      name: params.name,
+      task: params.task,
+      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      interactive,
+      exitCode: 1,
+      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      error: err?.message ?? String(err),
+    };
   }
 }
 
@@ -166,259 +398,75 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const interactive = params.interactive !== false; // default true
-      const startTime = Date.now();
-
-      // Load agent defaults if specified — explicit params override
-      const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-      const effectiveModel = params.model ?? agentDefs?.model;
-      const effectiveTools = params.tools ?? agentDefs?.tools;
-      const effectiveSkills = params.skills ?? agentDefs?.skills;
-      const effectiveThinking = agentDefs?.thinking;
+      const interactive = params.interactive !== false;
 
       // Validate prerequisites
       if (!isCmuxAvailable()) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "Subagents require cmux. Start pi inside cmux (`cmux pi`) to use interactive subagents.",
-            },
-          ],
+          content: [{ type: "text", text: "Subagents require cmux. Start pi inside cmux (`cmux pi`) to use interactive subagents." }],
           details: { error: "cmux not available" },
         };
       }
 
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile) {
+      if (!ctx.sessionManager.getSessionFile()) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "Error: no session file. Start pi with a persistent session to use subagents.",
-            },
-          ],
+          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
           details: { error: "no session file" },
         };
       }
 
-      let surface: string | null = null;
+      const startTime = Date.now();
 
-      try {
+      onUpdate?.({
+        content: [{ type: "text", text: "starting…" }],
+        details: {
+          name: params.name,
+          interactive,
+          task: params.task,
+          startTime,
+        },
+      });
 
-        // Record existing session files BEFORE spawning so we can identify
-        // which file the sub-agent created (not just "newest")
-        const sessionDir = dirname(sessionFile);
-        const existingSessionFiles = new Set(
-          readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-        );
-
-        // Create cmux surface
-        surface = createSurface(params.name);
-
-        // Wait for surface to initialize
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
-
-        // Build the task message with preamble baked in.
-        // In a long session, --append-system-prompt gets buried and ignored.
-        // Putting the preamble in the user message ensures it's the last thing
-        // the agent sees and actually responds to.
-        const modeHint = interactive
-          ? "The user will interact with you here. When done, they will exit with Ctrl+D."
-          : "Complete your task autonomously. When finished, call the subagent_done tool to close this session.";
-        const summaryInstruction =
-          "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-        // Agent identity: agent .md body > explicit systemPrompt > nothing.
-        const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-        const roleBlock = identity ? `\n\n${identity}` : "";
-
-        const fullTask =
-          `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-
-        const contextBytes = Buffer.byteLength(fullTask, "utf8");
-
-        // Build pi command
-        const parts: string[] = ["pi"];
-
-        // Fork mode: copy the session file so the sub-agent has full context.
-        // Used for iterate/bugfix patterns where context matters.
-        // Default: fresh session — avoids overwhelming the agent in long sessions.
-        let forkedSessionFile: string | null = null;
-        if (params.fork) {
-          const { copySessionFile } = await import("./session.ts");
-          forkedSessionFile = copySessionFile(sessionFile, dirname(sessionFile));
-          parts.push("--session", shellEscape(forkedSessionFile));
-        } else {
-          parts.push("--session-dir", shellEscape(dirname(sessionFile)));
-        }
-        // Always load subagent-done on top of whatever extensions auto-discover.
-        // Subagents are full pi sessions — same extensions, same skills.
-        // This means a subagent CAN spawn another subagent (planner → scout).
-        const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
-        if (effectiveModel) {
-          const model = effectiveThinking
-            ? `${effectiveModel}:${effectiveThinking}`
-            : effectiveModel;
-          parts.push("--model", shellEscape(model));
-        }
-
-        if (effectiveTools) {
-          // --tools only accepts builtins. Extension-provided tools (todo,
-          // write_artifact, etc.) are available via auto-discovered extensions.
-          const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-          const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
-          if (builtins.length > 0) {
-            parts.push("--tools", shellEscape(builtins.join(",")));
-          }
-        }
-
-        // Write task to a temp file and use @file syntax.
-        // Terminal input buffers truncate around 4096 bytes, and agent bodies +
-        // skills + task can easily exceed that when passed as a CLI argument.
-        // Skills go as separate /skill:name messages so pi renders them
-        // as proper skill invocation blocks, not buried in the task file.
-        const skillNames: string[] = [];
-        if (effectiveSkills) {
-          for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
-            skillNames.push(skill);
-            parts.push(shellEscape(`/skill:${skill}`));
-          }
-        }
-
-        // Write context to a persistent artifact file instead of a temp file.
-        // This shows up as a visible file write and persists as a record of
-        // what context was sent to the sub-agent.
-        const sessionId = ctx.sessionManager.getSessionId();
-        const artifactDir = getArtifactDir(ctx.cwd, sessionId);
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
-        const artifactPath = join(artifactDir, artifactName);
-        mkdirSync(dirname(artifactPath), { recursive: true });
-        writeFileSync(artifactPath, fullTask, "utf8");
-        parts.push(`@${artifactPath}`);
-
-        const piCommand = parts.join(" ");
-        const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-
-        // Send to surface
-        sendCommand(surface, command);
-
-        // Emit progress via onUpdate so renderResult(isPartial) can show it.
-        // This works now because pollForExit uses async readScreen, keeping
-        // the event loop free for process.nextTick renders.
+      const result = await runSubagent(params, ctx, signal ?? new AbortController().signal, (info) => {
         onUpdate?.({
-          content: [{ type: "text", text: "starting…" }],
+          content: [{ type: "text", text: `${info.elapsed} elapsed` }],
           details: {
             name: params.name,
             interactive,
             task: params.task,
             startTime,
-            contextBytes,
+            sessionEntries: info.entries,
+            sessionBytes: info.bytes,
           },
         });
+      });
 
-        // Poll for exit
-        const interval = interactive ? 3000 : 1000;
-
-        const exitCode = await pollForExit(surface, signal ?? new AbortController().signal, {
-          interval,
-          onTick() {
-            const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
-            const progress = measureSessionProgress(sessionDir, existingSessionFiles, forkedSessionFile);
-
-            onUpdate?.({
-              content: [{ type: "text", text: `${elapsed} elapsed` }],
-              details: {
-                name: params.name,
-                interactive,
-                task: params.task,
-                startTime,
-                contextBytes,
-                sessionEntries: progress?.entries,
-                sessionBytes: progress?.bytes,
-              },
-            });
-          },
-        });
-
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-
-        // Find the sub-agent's session file
-        let subSessionFile: { path: string } | undefined;
-        if (forkedSessionFile) {
-          // Fork mode: the forked file IS the sub-agent's session
-          subSessionFile = { path: forkedSessionFile };
-        } else {
-          // Find the NEW session file created by this sub-agent.
-          // Compare current files against the snapshot taken before spawning.
-          const newFiles = readdirSync(sessionDir)
-            .filter((f) => f.endsWith(".jsonl") && !existingSessionFiles.has(f))
-            .map((f) => ({ name: f, path: join(sessionDir, f), mtime: statSync(join(sessionDir, f)).mtimeMs }))
-            .sort((a, b) => b.mtime - a.mtime);
-          subSessionFile = newFiles[0];
-        }
-
-        let summary: string;
-        if (subSessionFile) {
-          const allEntries = getNewEntries(subSessionFile.path, 0);
-          summary =
-            findLastAssistantMessage(allEntries) ??
-            (exitCode !== 0
-              ? `Sub-agent exited with code ${exitCode}`
-              : "Sub-agent exited without output");
-        } else {
-          summary = exitCode !== 0
-            ? `Sub-agent exited with code ${exitCode}`
-            : "Sub-agent exited without output";
-        }
-
-        // Close surface
-        closeSurface(surface);
-        surface = null;
-
-        const sessionRef = subSessionFile
-          ? `\n\nSession: ${subSessionFile.path}\nResume: pi --session ${subSessionFile.path}`
-          : "";
-        const resultText =
-          exitCode !== 0
-            ? `Sub-agent exited with code ${exitCode}.\n\n${summary}${sessionRef}`
-            : `${summary}${sessionRef}`;
-
+      if (result.error) {
         return {
-          content: [{ type: "text", text: resultText }],
-          details: {
-            name: params.name,
-            task: params.task,
-            sessionFile: subSessionFile?.path,
-            interactive,
-            exitCode,
-            elapsed,
-          },
-        };
-      } catch (err: any) {
-        if (surface) {
-          try {
-            closeSurface(surface);
-          } catch {
-            // ignore cleanup errors
-          }
-          surface = null;
-        }
-        if (signal?.aborted) {
-          return {
-            content: [{ type: "text", text: "Subagent cancelled." }],
-            details: { error: "cancelled" },
-          };
-        }
-
-        const message = err?.message ?? String(err);
-        return {
-          content: [{ type: "text", text: `Subagent error: ${message}` }],
-          details: { error: message },
+          content: [{ type: "text", text: result.summary }],
+          details: { error: result.error },
         };
       }
+
+      const sessionRef = result.sessionFile
+        ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+        : "";
+      const resultText =
+        result.exitCode !== 0
+          ? `Sub-agent exited with code ${result.exitCode}.\n\n${result.summary}${sessionRef}`
+          : `${result.summary}${sessionRef}`;
+
+      return {
+        content: [{ type: "text", text: resultText }],
+        details: {
+          name: params.name,
+          task: params.task,
+          sessionFile: result.sessionFile,
+          interactive,
+          exitCode: result.exitCode,
+          elapsed: result.elapsed,
+        },
+      };
     },
 
     renderCall(args, theme) {
@@ -531,6 +579,249 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           : cleanSummary;
         if (preview) {
           text += "\n" + theme.fg("text", preview);
+        }
+        text += " " + theme.fg("muted", `(${keyHint("expandTools", "to expand")})`);
+      }
+
+      return new Text(text, 0, 0);
+    },
+  });
+
+  // parallel_subagents tool — run multiple autonomous subagents concurrently
+  const ParallelSubagentEntry = Type.Object({
+    name: Type.String({ description: "Display name for this subagent" }),
+    task: Type.String({ description: "Task/prompt for the sub-agent" }),
+    agent: Type.Optional(Type.String({ description: "Agent name to load defaults from (e.g. 'scout', 'worker')" })),
+    systemPrompt: Type.Optional(Type.String({ description: "Appended to system prompt" })),
+    model: Type.Optional(Type.String({ description: "Model override" })),
+    skills: Type.Optional(Type.String({ description: "Comma-separated skills" })),
+    tools: Type.Optional(Type.String({ description: "Comma-separated tools" })),
+  });
+
+  pi.registerTool({
+    name: "parallel_subagents",
+    label: "Parallel Subagents",
+    description:
+      "Run multiple autonomous sub-agents concurrently. Each agent spawns in its own cmux terminal " +
+      "and runs independently. Results stream in as each agent completes — you don't have to wait for all of them. " +
+      "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
+    parameters: Type.Object({
+      agents: Type.Array(ParallelSubagentEntry, {
+        description: "Array of subagent configurations to run in parallel",
+        minItems: 1,
+      }),
+    }),
+
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (!isCmuxAvailable()) {
+        return {
+          content: [{ type: "text", text: "Subagents require cmux. Start pi inside cmux (`cmux pi`) to use interactive subagents." }],
+          details: { error: "cmux not available" },
+        };
+      }
+
+      if (!ctx.sessionManager.getSessionFile()) {
+        return {
+          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
+          details: { error: "no session file" },
+        };
+      }
+
+      const startTime = Date.now();
+      const total = params.agents.length;
+      const completed: SubagentResult[] = [];
+      const agentStatus = new Map<string, { elapsed: string; entries?: number; bytes?: number; done: boolean }>();
+
+      // Initialize status for all agents
+      for (const a of params.agents) {
+        agentStatus.set(a.name, { elapsed: "0s", done: false });
+      }
+
+      const emitProgress = () => {
+        const lines: string[] = [];
+        for (const a of params.agents) {
+          const status = agentStatus.get(a.name)!;
+          if (status.done) {
+            const result = completed.find((r) => r.name === a.name);
+            const icon = result && result.exitCode === 0 ? "✓" : "✗";
+            lines.push(`${icon} ${a.name} — done (${formatElapsed(result?.elapsed ?? 0)})`);
+          } else {
+            const parts = [status.elapsed];
+            if (status.entries != null && status.bytes != null) {
+              parts.push(`${status.entries} msgs (${formatBytes(status.bytes)})`);
+            }
+            lines.push(`⟳ ${a.name} — ${parts.join(" · ")}`);
+          }
+        }
+
+        onUpdate?.({
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: {
+            startTime,
+            total,
+            completed: completed.length,
+            agents: Object.fromEntries(agentStatus),
+          },
+        });
+      };
+
+      emitProgress();
+
+      // Pre-create all surfaces with a tiled layout:
+      // First agent splits right from the orchestrator (side-by-side),
+      // subsequent agents split down from the first (stacked vertically).
+      const surfaces: string[] = [];
+      for (let i = 0; i < params.agents.length; i++) {
+        const name = params.agents[i].name;
+        if (i === 0) {
+          // First agent: split right from the orchestrator
+          surfaces.push(createSurfaceSplit(name, "right"));
+        } else {
+          // Subsequent agents: split down from the previous agent's surface
+          surfaces.push(createSurfaceSplit(name, "down", surfaces[i - 1]));
+        }
+      }
+
+      // Brief pause for surfaces to initialize
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+
+      // Shared set of claimed session files — prevents parallel agents
+      // from all locking onto the same "newest" file during progress polling.
+      const claimedFiles = new Set<string>();
+
+      // Run all agents concurrently
+      const effectiveSignal = signal ?? new AbortController().signal;
+      const promises = params.agents.map(async (agentParams, i) => {
+        // Force interactive: false for parallel agents
+        const fullParams = { ...agentParams, interactive: false as const, fork: false as const };
+
+        const result = await runSubagent(fullParams, ctx, effectiveSignal, (info) => {
+          agentStatus.set(agentParams.name, {
+            elapsed: info.elapsed,
+            entries: info.entries,
+            bytes: info.bytes,
+            done: false,
+          });
+          emitProgress();
+        }, { surface: surfaces[i], claimedFiles });
+
+        // Mark as done and emit progress immediately
+        agentStatus.set(agentParams.name, { elapsed: formatElapsed(result.elapsed), done: true });
+        completed.push(result);
+        emitProgress();
+
+        return result;
+      });
+
+      const results = await Promise.all(promises);
+      const totalElapsed = Math.floor((Date.now() - startTime) / 1000);
+
+      // Build combined result text
+      const sections = results.map((r) => {
+        const icon = r.exitCode === 0 ? "✓" : "✗";
+        const sessionRef = r.sessionFile
+          ? `\nSession: ${r.sessionFile}\nResume: pi --session ${r.sessionFile}`
+          : "";
+        return `## ${icon} ${r.name} (${formatElapsed(r.elapsed)})\n\n${r.summary}${sessionRef}`;
+      });
+
+      const succeeded = results.filter((r) => r.exitCode === 0).length;
+      const failed = results.filter((r) => r.exitCode !== 0).length;
+      const header = `${succeeded}/${total} succeeded` + (failed > 0 ? `, ${failed} failed` : "") + ` in ${formatElapsed(totalElapsed)}`;
+
+      return {
+        content: [{ type: "text", text: `${header}\n\n${sections.join("\n\n")}` }],
+        details: {
+          total,
+          succeeded,
+          failed,
+          elapsed: totalElapsed,
+          results: results.map((r) => ({
+            name: r.name,
+            task: r.task,
+            exitCode: r.exitCode,
+            elapsed: r.elapsed,
+            sessionFile: r.sessionFile,
+          })),
+        },
+      };
+    },
+
+    renderCall(args, theme) {
+      const agents = args.agents ?? [];
+      let text = theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
+        theme.fg("dim", ` — ${agents.length} agent${agents.length !== 1 ? "s" : ""}`);
+
+      for (const a of agents) {
+        const agent = a.agent ? theme.fg("dim", ` (${a.agent})`) : "";
+        const task = a.task ?? "";
+        const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
+        const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
+        text += "\n  ▹ " + theme.fg("toolOutput", a.name ?? "unnamed") + agent;
+        if (preview) text += theme.fg("dim", ` — ${preview}`);
+      }
+
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, { expanded, isPartial }, theme) {
+      const details = result.details as any;
+
+      if (isPartial) {
+        const total: number = details?.total ?? 0;
+        const completedCount: number = details?.completed ?? 0;
+        const startTime: number | undefined = details?.startTime;
+        const elapsed = startTime
+          ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
+          : "…";
+        const agents: Record<string, { elapsed: string; entries?: number; bytes?: number; done: boolean }> =
+          details?.agents ?? {};
+
+        let text = theme.fg("dim", `${completedCount}/${total} done · ${elapsed} elapsed`);
+
+        for (const [name, status] of Object.entries(agents)) {
+          if (status.done) {
+            text += "\n  " + theme.fg("success", "✓") + " " + theme.fg("toolTitle", name) +
+              theme.fg("dim", ` — done`);
+          } else {
+            const parts = [status.elapsed];
+            if (status.entries != null && status.bytes != null) {
+              parts.push(`${status.entries} msgs (${formatBytes(status.bytes)})`);
+            } else {
+              parts.push("loading…");
+            }
+            text += "\n  " + theme.fg("dim", "⟳") + " " + theme.fg("toolTitle", name) +
+              theme.fg("dim", ` — ${parts.join(" · ")}`);
+          }
+        }
+
+        return new Text(text, 0, 0);
+      }
+
+      // Completed
+      const total: number = details?.total ?? 0;
+      const succeeded: number = details?.succeeded ?? 0;
+      const failed: number = details?.failed ?? 0;
+      const elapsed: number = details?.elapsed ?? 0;
+      const results: any[] = details?.results ?? [];
+
+      const statusIcon = failed === 0 ? theme.fg("success", "✓") : theme.fg("warning", "⚠");
+      let text = statusIcon + " " +
+        theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
+        theme.fg("dim", ` — ${succeeded}/${total} succeeded (${formatElapsed(elapsed)})`);
+
+      if (expanded) {
+        const summaryText = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+        // Skip the header line, show the rest
+        const body = summaryText.split("\n").slice(1).join("\n").trim();
+        if (body) {
+          text += "\n" + theme.fg("text", body);
+        }
+      } else {
+        for (const r of results) {
+          const icon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+          text += "\n  " + icon + " " + theme.fg("toolTitle", r.name) +
+            theme.fg("dim", ` (${formatElapsed(r.elapsed)})`);
         }
         text += " " + theme.fg("muted", `(${keyHint("expandTools", "to expand")})`);
       }

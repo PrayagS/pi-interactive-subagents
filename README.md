@@ -164,6 +164,58 @@ subagent({
 
 ---
 
+## Parallel Subagents
+
+The `parallel_subagents` tool runs multiple autonomous sub-agents concurrently with a single tool call. Each agent gets its own cmux terminal in a tiled layout, and progress updates stream in as each agent completes.
+
+```typescript
+parallel_subagents({
+  agents: [
+    { name: "Scout: Auth", agent: "scout", task: "Analyze the authentication module" },
+    { name: "Scout: Database", agent: "scout", task: "Map the database schema and query patterns" },
+    { name: "Scout: API", agent: "scout", task: "Document the REST API endpoints" },
+  ]
+})
+```
+
+### Terminal Layout
+
+Parallel agents are arranged in a tiled layout next to the orchestrator:
+
+```
+┌──────────────────┬──────────────────┐
+│                  │  Scout: Auth     │
+│                  ├──────────────────┤
+│   Orchestrator   │  Scout: Database │
+│                  ├──────────────────┤
+│                  │  Scout: API      │
+└──────────────────┴──────────────────┘
+```
+
+The first agent splits right from the orchestrator (side-by-side). Each subsequent agent splits down from the previous one (stacked vertically). All terminals are visible simultaneously.
+
+### Progress Rendering
+
+Unlike separate `subagent` calls, `parallel_subagents` is a single tool call — so progress updates render immediately as each agent finishes:
+
+```
+1/3 done · 45s elapsed
+  ✓ Scout: Auth — done
+  ⟳ Scout: Database — 32s · 12 msgs (8.2KB)
+  ⟳ Scout: API — 28s · 8 msgs (5.1KB)
+```
+
+### Good Candidates for Parallelism
+
+- Multiple scouts gathering context from different parts of the codebase
+- Independent workers on non-overlapping tasks (be careful with git conflicts)
+- A scout + a researcher running simultaneously
+- Parallel research on different topics
+
+All agents run autonomously (`interactive: false` is enforced). Each parameter accepts the same options as `subagent` except `interactive` and `fork`.
+
+---
+
 ## Custom Agents
 
 Create your own agent definitions. Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
