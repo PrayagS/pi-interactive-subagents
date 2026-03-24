@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -263,35 +263,36 @@ function formatElapsedMMSS(startTime: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-const ACCENT_COLOR = "\x1b[38;2;77;163;255m";
-const RESET = "\x1b[0m";
+const ACCENT = "\x1b[38;2;77;163;255m";
+const RST = "\x1b[0m";
 
 /**
  * Build a bordered widget line: │ content │
+ * Truncates content to fit within innerWidth.
  */
 function borderLine(content: string, innerWidth: number): string {
-  // We need to measure visible width to pad correctly
-  const visible = content.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const truncated = truncateToWidth(content, innerWidth);
+  const visible = visibleWidth(truncated);
   const pad = Math.max(0, innerWidth - visible);
-  return `${ACCENT_COLOR}│${RESET} ${content}${" ".repeat(pad)} ${ACCENT_COLOR}│${RESET}`;
+  return `${ACCENT}│${RST}${truncated}${" ".repeat(pad)}${ACCENT}│${RST}`;
 }
 
 /**
- * Build the bordered top line: ╭─ Title ──────── info ─╮
+ * Build the bordered top line: ╭─ Title ──── info ─╮
  */
 function borderTop(title: string, info: string, innerWidth: number): string {
   const titlePart = ` ${title} `;
   const infoPart = ` ${info} `;
   const fillLen = Math.max(0, innerWidth - titlePart.length - infoPart.length);
   const fill = "─".repeat(fillLen);
-  return `${ACCENT_COLOR}╭─${titlePart}${fill}${infoPart}─╮${RESET}`;
+  return truncateToWidth(`${ACCENT}╭─${titlePart}${fill}${infoPart}─╮${RST}`, innerWidth + 2);
 }
 
 /**
- * Build the bordered bottom line: ╰──────────────────────╯
+ * Build the bordered bottom line: ╰──────────────────╯
  */
 function borderBottom(innerWidth: number): string {
-  return `${ACCENT_COLOR}╰─${"─".repeat(innerWidth)}─╯${RESET}`;
+  return `${ACCENT}╰${"─".repeat(innerWidth)}╯${RST}`;
 }
 
 function updateWidget() {
@@ -312,7 +313,7 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          const innerWidth = Math.max(10, width - 4);
+          const innerWidth = Math.max(4, width - 2);
           const count = runningSubagents.size;
           const title = "Subagents";
           const info = `${count} running`;
@@ -328,7 +329,7 @@ function updateWidget() {
                 : "starting…";
 
             lines.push(borderLine(
-              `${ACCENT_COLOR}⟳${RESET} ${elapsed}  ${agent.name}${agentTag}  ${progress}`,
+              ` ${elapsed}  ${agent.name}${agentTag}  ${progress}`,
               innerWidth,
             ));
           }
