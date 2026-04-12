@@ -151,6 +151,33 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 ---
 
+## caller_ping — Child-to-Parent Help Request
+
+The `caller_ping` tool lets a subagent pause and request help from its parent agent mid-execution. When called, the child blocks until the parent responds.
+
+**Parameters:**
+- `message` (required): What you need help with
+
+**Interaction flow:**
+1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
+2. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
+3. Parent inspects the child's terminal (or simply reads the notification) and types a response
+4. Child resumes with the parent's input as its next turn
+
+**Example:**
+```typescript
+// Inside a worker subagent
+const guidance = await caller_ping({
+  message: "Found two conflicting migration files — should I use v1 or v2?"
+});
+// parent types "Use v2, v1 is deprecated"
+// child resumes
+```
+
+> **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+
+---
+
 ## The `/plan` Workflow
 
 The `/plan` command orchestrates a full planning-to-implementation pipeline.
