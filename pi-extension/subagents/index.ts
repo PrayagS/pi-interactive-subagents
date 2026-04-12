@@ -658,30 +658,7 @@ async function watchSubagent(
           }
         } catch {}
 
-        // Check for caller_ping from child
-        try {
-          const pingFile = `${sessionFile}.ping`;
-          if (existsSync(pingFile)) {
-            const raw = readFileSync(pingFile, "utf8");
-            const data = JSON.parse(raw);
-            unlinkSync(pingFile); // Delete after successful parse to avoid losing pings on bad reads
 
-            pi.sendMessage(
-              {
-                customType: "subagent_ping",
-                content: `Sub-agent "${data.name}" needs help:\n\n${data.message}\n\nYou can inspect the child's terminal with cmux readScreen, or send input via cmux sendCommand to surface "${running.surface}".`,
-                display: true,
-                details: {
-                  name: data.name,
-                  message: data.message,
-                  surface: running.surface,
-                  agent: running.agent,
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          }
-        } catch {}
       },
     });
 
@@ -828,6 +805,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+
+            // Check if this was a caller_ping (child wrote .ping file before exiting)
+            const pingFile = result.sessionFile ? `${result.sessionFile}.ping` : null;
+            let pingData: { name: string; message: string } | null = null;
+            if (pingFile) {
+              try {
+                if (existsSync(pingFile)) {
+                  pingData = JSON.parse(readFileSync(pingFile, "utf8"));
+                  unlinkSync(pingFile);
+                }
+              } catch {}
+            }
+
+            if (pingData) {
+              // Subagent is requesting help — steer a ping message with session path for resume
+              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+              pi.sendMessage(
+                {
+                  customType: "subagent_ping",
+                  content: `Sub-agent "${pingData.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${pingData.message}${sessionRef}`,
+                  display: true,
+                  details: {
+                    name: pingData.name,
+                    message: pingData.message,
+                    agent: running.agent,
+                    sessionFile: result.sessionFile,
+                  },
+                },
+                { triggerTurn: true, deliverAs: "steer" },
+              );
+              return;
+            }
+
             const sessionRef = result.sessionFile
               ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
               : "";
@@ -1356,9 +1366,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (options.expanded) {
           contentLines.push("");
           contentLines.push(details.message ?? "");
-          if (details.surface) {
+          if (details.sessionFile) {
             contentLines.push("");
-            contentLines.push(theme.fg("dim", `Surface: ${details.surface}`));
+            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
           }
         } else {
           const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);

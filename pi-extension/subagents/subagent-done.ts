@@ -34,7 +34,6 @@ export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
-  let callerPingActive = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -122,8 +121,6 @@ export default function (pi: ExtensionAPI) {
       // Ignore the initial task message that starts an autonomous subagent.
       // Only inputs after the first agent run has started count as user takeover.
       if (!shouldMarkUserTookOver(agentStarted)) return;
-      // Don't count parent responses to caller_ping as manual takeover.
-      if (callerPingActive) return;
       userTookOver = true;
     });
 
@@ -155,18 +152,18 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Caller Ping",
     description:
-      "Send a help request to the parent agent and block until they respond. " +
-      "Use when you're stuck, need clarification, or need the parent to take action. " +
-      "The parent will be notified and can inspect your terminal or send you input.",
+      "Send a help request to the parent agent and exit this session. " +
+      "The parent will be notified with your message and can resume this session with a response. " +
+      "Use when you're stuck, need clarification, or need the parent to take action.",
     parameters: Type.Object({
       message: Type.String({ description: "What you need help with" }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
           "caller_ping is only available in subagent contexts. " +
-          "PI_SUBAGENT_SESSION environment variable is not set."
+            "PI_SUBAGENT_SESSION environment variable is not set.",
         );
       }
 
@@ -176,20 +173,11 @@ export default function (pi: ExtensionAPI) {
       };
       writeFileSync(`${sessionFile}.ping`, JSON.stringify(pingData));
 
-      callerPingActive = true;
-      return new Promise((resolve) => {
-        let fired = false;
-        pi.on("input", (event) => {
-          if (fired) return;
-          fired = true;
-          callerPingActive = false;
-          const text = (event as any).text ?? "";
-          resolve({
-            content: [{ type: "text", text: text || "Parent responded. Resuming." }],
-            details: {},
-          });
-        });
-      });
+      ctx.shutdown();
+      return {
+        content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
+        details: {},
+      };
     },
   });
 
