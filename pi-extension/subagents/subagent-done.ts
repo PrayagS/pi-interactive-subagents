@@ -147,6 +147,32 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // SPIKE TODO: temporary test tool — remove after verification
+  // Findings: pi.on("input") returns void (no unsubscribe fn, no pi.off()).
+  // For one-shot cleanup, use a `fired` flag. Alternatively, use
+  // pi.ui.onTerminalInput() which DOES return an unsubscribe function.
+  pi.registerTool({
+    name: "_test_block",
+    label: "Test Block",
+    description: "TEST ONLY — blocks until user input is received via pi.on('input')",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+      return new Promise((resolve) => {
+        let fired = false;
+        console.log("[_test_block] Blocking... waiting for input");
+        pi.on("input", (event) => {
+          if (fired) return;
+          fired = true;
+          console.log("[_test_block] Input received! Unblocking. text:", (event as any).text);
+          resolve({
+            content: [{ type: "text", text: `Input received! Unblocking. text: ${(event as any).text}` }],
+            details: {},
+          });
+        });
+      });
+    },
+  });
+
   pi.registerTool({
     name: "subagent_done",
     label: "Subagent Done",
