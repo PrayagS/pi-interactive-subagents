@@ -34,6 +34,7 @@ export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
+  let callerPingActive = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -121,6 +122,8 @@ export default function (pi: ExtensionAPI) {
       // Ignore the initial task message that starts an autonomous subagent.
       // Only inputs after the first agent run has started count as user takeover.
       if (!shouldMarkUserTookOver(agentStarted)) return;
+      // Don't count parent responses to caller_ping as manual takeover.
+      if (callerPingActive) return;
       userTookOver = true;
     });
 
@@ -173,13 +176,16 @@ export default function (pi: ExtensionAPI) {
       };
       writeFileSync(`${sessionFile}.ping`, JSON.stringify(pingData));
 
+      callerPingActive = true;
       return new Promise((resolve) => {
         let fired = false;
-        pi.on("input", () => {
+        pi.on("input", (event) => {
           if (fired) return;
           fired = true;
+          callerPingActive = false;
+          const text = (event as any).text ?? "";
           resolve({
-            content: [{ type: "text", text: "Parent responded. Resuming." }],
+            content: [{ type: "text", text: text || "Parent responded. Resuming." }],
             details: {},
           });
         });

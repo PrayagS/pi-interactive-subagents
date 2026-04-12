@@ -167,11 +167,11 @@ The `caller_ping` tool lets a subagent pause and request help from its parent ag
 **Example:**
 ```typescript
 // Inside a worker subagent
-const guidance = await caller_ping({
+await caller_ping({
   message: "Found two conflicting migration files — should I use v1 or v2?"
 });
-// parent types "Use v2, v1 is deprecated"
-// child resumes
+// parent types "Use v2, v1 is deprecated" into the child's terminal
+// child resumes with the parent's response as its next user message
 ```
 
 > **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.

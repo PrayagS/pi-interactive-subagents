@@ -663,8 +663,8 @@ async function watchSubagent(
           const pingFile = `${sessionFile}.ping`;
           if (existsSync(pingFile)) {
             const raw = readFileSync(pingFile, "utf8");
-            unlinkSync(pingFile); // Delete before steering to avoid re-detection
             const data = JSON.parse(raw);
+            unlinkSync(pingFile); // Delete after successful parse to avoid losing pings on bad reads
 
             pi.sendMessage(
               {
