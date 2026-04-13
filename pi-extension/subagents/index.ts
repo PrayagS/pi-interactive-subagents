@@ -616,7 +616,7 @@ async function launchSubagent(
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
-    parts.push(`@${artifactPath}`);
+    parts.push(shellEscape(`@${artifactPath}`));
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
@@ -1158,7 +1158,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
           writeFileSync(msgFile, params.message, "utf8");
           cleanupMsgFile = msgFile;
-          parts.push(`@${msgFile}`);
+          parts.push(shellEscape(`@${msgFile}`));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
