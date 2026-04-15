@@ -264,6 +264,8 @@ interface RunningSubagent {
   entries?: number;
   bytes?: number;
   abortController?: AbortController;
+  cli?: string;
+  sentinelFile?: string;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -454,6 +456,76 @@ async function launchSubagent(
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, 500));
   }
+
+  // ── Claude Code CLI path ──
+  if (agentDefs?.cli === "claude") {
+    const sentinelFile = `/tmp/pi-claude-${id}-done`;
+    const pluginDir = join(dirname(new URL(import.meta.url).pathname), "plugin");
+
+    const cmdParts: string[] = [];
+    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+    cmdParts.push("claude");
+    cmdParts.push("--dangerously-skip-permissions");
+
+    if (existsSync(pluginDir)) {
+      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+    }
+
+    if (effectiveModel) {
+      cmdParts.push("--model", shellEscape(effectiveModel));
+    }
+
+    const sp = params.systemPrompt ?? agentDefs?.body;
+    if (sp) {
+      cmdParts.push("--append-system-prompt", shellEscape(sp));
+    }
+
+    if (params.resumeSessionId) {
+      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
+    }
+
+    if (!params.resumeSessionId) {
+      cmdParts.push(shellEscape(params.task));
+    }
+
+    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+
+    const launchScriptName = `${(params.name || "subagent")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Claude Code subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface,
+      startTime,
+      sessionFile: subagentSessionFile,
+      launchScriptFile,
+      cli: "claude",
+      sentinelFile,
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  }
+
+  // ── Pi CLI path (existing, unchanged) ──
 
   // Build the task message
   // When forking, the sub-agent already has the full conversation context.
